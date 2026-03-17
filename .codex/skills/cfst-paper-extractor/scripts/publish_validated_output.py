@@ -33,6 +33,30 @@ def append_jsonl(path: Path, payload: Any) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def update_batch_state(
+    batch_state_path: Path,
+    paper_id: str,
+    *,
+    published: bool,
+    validated: bool,
+    status: str,
+    last_error: str | None,
+) -> None:
+    payload = read_json(batch_state_path)
+    papers = payload.get("papers", [])
+    for paper in papers:
+        if paper.get("paper_id") != paper_id:
+            continue
+        paper["published"] = published
+        paper["validated"] = validated
+        paper["status"] = status
+        paper["last_error"] = last_error
+        write_json(batch_state_path, payload)
+        return
+
+    raise ValueError(f"paper_id not found in batch state: {paper_id}")
+
+
 def publish_one(
     source_json: Path,
     dest_json: Path,
@@ -67,6 +91,18 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True, help="Final output directory.")
     parser.add_argument("--publish-log", type=Path, required=True, help="JSONL publish log path.")
     parser.add_argument(
+        "--batch-state",
+        type=Path,
+        default=None,
+        help="Optional batch_state.json path to update as papers publish.",
+    )
+    parser.add_argument(
+        "--paper-ids",
+        nargs="*",
+        default=None,
+        help="Optional subset of paper_ids to publish. Defaults to all papers in the batch manifest.",
+    )
+    parser.add_argument(
         "--strict-rounding",
         action="store_true",
         help="Fail publication when numeric rounding is not 0.001.",
@@ -75,8 +111,18 @@ def main() -> int:
 
     manifest = read_json(args.batch_manifest)
     papers = manifest.get("papers", [])
+    requested_ids = set(args.paper_ids or [])
+    if requested_ids:
+        available_ids = {paper["paper_id"] for paper in papers}
+        missing_ids = sorted(requested_ids - available_ids)
+        if missing_ids:
+            print(f"[FAIL] Unknown paper_ids in --paper-ids: {', '.join(missing_ids)}")
+            return 1
+        papers = [paper for paper in papers if paper["paper_id"] in requested_ids]
+
     publish_summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "requested_paper_ids": sorted(requested_ids) if requested_ids else None,
         "published": 0,
         "failed": 0,
         "items": [],
@@ -105,6 +151,19 @@ def main() -> int:
         }
         append_jsonl(args.publish_log, log_item)
         publish_summary["items"].append(log_item)
+        if args.batch_state:
+            try:
+                update_batch_state(
+                    batch_state_path=args.batch_state,
+                    paper_id=paper_id,
+                    published=ok,
+                    validated=ok,
+                    status="published" if ok else "publish_failed",
+                    last_error=None if ok else message,
+                )
+            except ValueError as exc:
+                print(f"[FAIL] {paper_id}: {exc}")
+                return 1
         if ok:
             publish_summary["published"] += 1
             print(f"[OK] {paper_id}: {dest_json}")

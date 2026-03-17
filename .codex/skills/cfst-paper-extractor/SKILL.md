@@ -29,10 +29,21 @@ Use this sequence as the canonical parent-agent orchestration path. If you follo
 
 - `output/manifests/batch_manifest.json`: batch summary, paper titles, and PDF inspection results.
 - `output/manifests/worker_jobs.json`: source of truth for `paper_id`, `paper_pdf_relpath`, worker temp JSON path, and final output path.
-- `output/manifests/batch_state.json`: parent-owned per-paper state tracker.
+- `output/manifests/batch_state.json`: parent-owned per-paper state tracker; parent updates it during worker launch, worker completion, retry/failure handling, and publication.
 - `output/tmp/<paper_id>/<paper_id>.json`: sandbox-visible temp JSON path.
 - `worker_jobs.json[*].worker_output_json_path`: on-disk host-backed temp JSON path; workers must write here so the sandbox bind mount can see the same file at `output/tmp/<paper_id>/<paper_id>.json`.
 - `output/output/<paper_id>.json`: canonical published artifact; parent writes here only through `publish_validated_output.py`.
+
+### Batch State Status Values
+
+- `prepared`: initial state written by `prepare_batch.py` for a paper that is ready to spawn.
+- `running`: the parent has launched the one-paper worker and is waiting for a terminal result.
+- `ready_for_publication`: the worker reported success and the parent confirmed the temp JSON exists.
+- `failed`: the latest worker attempt failed before publication. `last_error` should contain the exact failure string. Increment `retry_count` when recording this state.
+- `published`: the canonical JSON was published successfully to `output/output/<paper_id>.json`.
+- `publish_failed`: publication failed even though the parent reached the publish step. `last_error` should contain the publication failure string.
+
+`validated` means the current temp or published JSON passed validator checks. `published` means the canonical output file exists in the final output directory.
 
 ### Direct-Use Sequence
 
@@ -62,7 +73,7 @@ python .codex/skills/cfst-paper-extractor/scripts/git_worktree_isolation.py crea
   --output-dir output/tmp/<paper_id>
 ```
 
-This returns a JSON object. Record at least:
+This returns a JSON object. The created worker worktree is pruned to the owned paper payload, the owned skill payload, and git metadata so unrelated tracked repository content does not appear in the worker directory. Record at least:
 
 - `worktree_path`
 - `branch`
@@ -80,6 +91,29 @@ This returns a JSON object. Record at least:
 - `output_host_path=<output_host_path>`
 - `temp_json_workspace_path=output/tmp/<paper_id>/<paper_id>.json`
 - `temp_json_host_path=<worker_output_json_path_from_worker_jobs.json>`
+
+Immediately after launch, update the parent-owned state tracker:
+
+```bash
+python .codex/skills/cfst-paper-extractor/scripts/update_batch_state.py \
+  --batch-state output/manifests/batch_state.json \
+  --paper-id <paper_id> \
+  --status running \
+  --validated false \
+  --published false \
+  --clear-last-error
+```
+
+Parent agents should not need to inspect `update_batch_state.py` source. Use only these arguments in the parent flow:
+
+- `--batch-state`: path to `output/manifests/batch_state.json`
+- `--paper-id`: owned paper id
+- `--status`: one of `running`, `ready_for_publication`, `failed`, `published`, or `publish_failed`
+- `--validated true|false`: whether validator-backed output currently exists for that paper
+- `--published true|false`: whether canonical output currently exists in `output/output/`
+- `--last-error '<exact failure>'`: record the exact failure string when the paper is in a failed state
+- `--clear-last-error`: clear `last_error` on a clean transition such as launch, ready-for-publication, or published
+- `--increment-retry-count`: use when recording a failed worker attempt
 
 6. Use this worker brief template verbatim except for placeholder substitution:
 
@@ -149,6 +183,31 @@ Return exactly:
 - If the worker fails with a path, mount, or sandbox startup problem, treat that as a parent-side orchestration issue. Fix the command or worktree/output binding first, then rerun on a fresh worktree; do not ask the worker to relocate outputs on its own.
 - If the retry also fails, mark the paper failed and continue the batch. Do not block unrelated papers.
 
+After a successful worker result with a confirmed temp JSON, update the state tracker:
+
+```bash
+python .codex/skills/cfst-paper-extractor/scripts/update_batch_state.py \
+  --batch-state output/manifests/batch_state.json \
+  --paper-id <paper_id> \
+  --status ready_for_publication \
+  --validated true \
+  --published false \
+  --clear-last-error
+```
+
+After a failed worker result, update the state tracker before any retry or final failure handling:
+
+```bash
+python .codex/skills/cfst-paper-extractor/scripts/update_batch_state.py \
+  --batch-state output/manifests/batch_state.json \
+  --paper-id <paper_id> \
+  --status failed \
+  --validated false \
+  --published false \
+  --increment-retry-count \
+  --last-error '<exact failure>'
+```
+
 While a worker remains in normal `running` state and has not reported a concrete failure, interrupt, or terminal result, do not interrupt, replace, or redirect it. One-paper extraction can legitimately exceed a short wait timeout. Use generous waits and only intervene on terminal status or concrete blockers.
 
 8. After the worker exits, confirm the temp JSON exists at `worker_output_json_path` in the parent workspace. This same file must also be visible inside the sandbox at `output/tmp/<paper_id>/<paper_id>.json` because `--host-output-dir` binds the parent directory into `output_dir`.
@@ -166,11 +225,14 @@ python .codex/skills/cfst-paper-extractor/scripts/git_worktree_isolation.py remo
 ```bash
 python .codex/skills/cfst-paper-extractor/scripts/publish_validated_output.py \
   --batch-manifest output/manifests/batch_manifest.json \
+  --batch-state output/manifests/batch_state.json \
   --tmp-root output/tmp \
   --output-dir output/output \
   --publish-log output/logs/publish_log.jsonl \
   --strict-rounding
 ```
+
+For a focused republish after a successful single-paper rerun, you may additionally pass `--paper-ids <paper_id>`.
 
 11. If repository policy requires checkpoints, run them only after publication:
 
@@ -250,7 +312,8 @@ python .codex/skills/cfst-paper-extractor/scripts/bootstrap_git_repo.py \
 
 - `scripts/prepare_batch.py`: preferred entry point; discover processed PDF files, verify readability, and write manifests/state for worker orchestration.
 - `scripts/validate_single_output.py`: sandbox-only validator for one worker-local schema-v2 JSON; checks shape, provenance, plausibility, ordinary-filter consistency, and rounding.
-- `scripts/publish_validated_output.py`: revalidate worker outputs, publish final JSON, and append a publish log.
+- `scripts/publish_validated_output.py`: revalidate worker outputs, publish final JSON, append a publish log, optionally publish only selected `--paper-ids`, and update `batch_state.json` when `--batch-state` is provided.
+- `scripts/update_batch_state.py`: update one paper entry in `batch_state.json` from the parent orchestration flow.
 - `scripts/git_worktree_isolation.py`: create and remove per-paper git worktrees. In the parent flow, `create` also returns `output_host_path`, the persistent host directory that should be bound into `worker_sandbox.py`.
 - `scripts/worker_sandbox.py`: mandatory worker launcher; it mounts paper inputs read-only and the worker-local output directory read-write. Use `--host-output-dir` in parent-managed batches so worker temp outputs persist outside the worktree; never bypass it.
 - `scripts/bootstrap_git_repo.py`: initialize a repo and optional empty commit so worktree execution can start.

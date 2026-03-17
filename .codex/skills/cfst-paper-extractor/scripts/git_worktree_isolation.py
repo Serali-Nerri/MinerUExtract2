@@ -13,13 +13,18 @@ import time
 from pathlib import Path
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         check=False,
         text=True,
         capture_output=True,
+        input=input_text,
     )
 
 
@@ -60,6 +65,13 @@ def _copy_tree(src: Path, dst: Path) -> None:
         shutil.copytree(src, dst)
     else:
         shutil.copy2(src, dst)
+
+
+def _delete_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 def _resolve_repo_relative(repo_root: Path, raw_path: str) -> tuple[Path, str]:
@@ -113,6 +125,31 @@ def _build_sandbox_paths(
     ]
     entry_cwd = str(paper_path)
     return allowed_rw, allowed_ro, entry_cwd
+
+
+def _prune_worktree_payload(wt_path: Path, keep_relpaths: list[str]) -> None:
+    targets = [Path(rel) for rel in keep_relpaths]
+
+    def recurse(current: Path, rel_current: Path, relevant_targets: list[Path]) -> None:
+        for child in list(current.iterdir()):
+            child_rel = Path(child.name) if rel_current == Path(".") else rel_current / child.name
+            child_targets = [
+                target
+                for target in relevant_targets
+                if len(target.parts) >= len(child_rel.parts)
+                and target.parts[: len(child_rel.parts)] == child_rel.parts
+            ]
+            if not child_targets:
+                _delete_path(child)
+                continue
+            if any(target == child_rel for target in child_targets):
+                continue
+            if child.is_dir():
+                recurse(child, child_rel, child_targets)
+            else:
+                _delete_path(child)
+
+    recurse(wt_path, Path("."), targets)
 
 
 def _create(args: argparse.Namespace) -> int:
@@ -174,6 +211,14 @@ def _create(args: argparse.Namespace) -> int:
     try:
         _copy_tree(paper_abs, wt_path / paper_rel)
         _copy_tree(skill_abs, wt_path / skill_rel)
+        _prune_worktree_payload(
+            wt_path,
+            keep_relpaths=[
+                ".git",
+                paper_rel,
+                skill_rel,
+            ],
+        )
         output_abs.mkdir(parents=True, exist_ok=True)
     except Exception as exc:  # noqa: BLE001
         _run(["git", "-C", str(repo_root), "worktree", "remove", "--force", str(wt_path)])
@@ -283,7 +328,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     create = sub.add_parser("create", help="Create one isolated worktree for one paper.")
-    create.add_argument("--paper-dir", required=True, help="Paper folder path under repository root.")
+    create.add_argument("--paper-dir", required=True, help="Paper path under repository root.")
     create.add_argument(
         "--skill-dir",
         default=".codex/skills/cfst-paper-extractor",
