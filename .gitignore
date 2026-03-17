@@ -1,7 +1,5 @@
-batch1/
 processed/
 output/
 tmp/
-Archive/
 __pycache__/
 *.pyc
